@@ -105,7 +105,12 @@ streamlit run app.py
 
 ## 🖼️ Screenshots
 
-*(Add screenshots of your Streamlit dashboard here if possible)*
+<img width="1919" height="980" alt="image" src="https://github.com/user-attachments/assets/d38f5cc7-ceee-499d-a8e4-9e7dc1322111" />
+
+<img width="1919" height="1023" alt="image" src="https://github.com/user-attachments/assets/e82cc520-d3b2-4a7e-ac73-d170171f9ed3" />
+
+<img width="1919" height="935" alt="image" src="https://github.com/user-attachments/assets/247caea6-3b57-4a38-bc76-afbf1cf9772b" />
+
 
 ---
 
