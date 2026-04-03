@@ -1,253 +1,407 @@
-# app.py
-import psutil
-import streamlit as st
+"""
+app.py
+Main Streamlit dashboard for AI Laptop Optimizer.
+Clean tabbed layout, cached data collection, no business logic here.
+"""
+
+import logging
+import time
+from typing import Optional
+
 import pandas as pd
-import plotly.express as px
-import os
-import shutil
-from datetime import datetime, timedelta
-from openai import OpenAI
-from sklearn.linear_model import LinearRegression
-from win10toast import ToastNotifier
-from urllib.parse import urlparse
-import requests
+import streamlit as st
 
-# -----------------------------
-# OpenAI client
-# -----------------------------
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+from config import config
+from database import initialize_db, fetch_metrics, fetch_recent_anomalies
+from monitor import (
+    collect_snapshot,
+    evaluate_alerts,
+    get_top_processes,
+    get_heavy_background_processes,
+    scan_idle_apps,
+    clean_temp_files,
+)
+from anomaly_detector import (
+    detect_anomalies,
+    forecast_usage,
+    compute_health_score,
+    build_trend_dataframe,
+)
+from ai_advisor import get_recommendations, check_url_safety
+from charts import (
+    metric_timeseries,
+    health_gauge,
+    top_processes_bar,
+    anomaly_scatter,
+    metric_distribution,
+)
 
-# -----------------------------
-# Notifications
-# -----------------------------
-toaster = ToastNotifier()
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    handlers=[
+        logging.FileHandler(str(config.DATA_DIR / "app.log") if hasattr(config, "DATA_DIR") else "app.log"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger(__name__)
 
-# -----------------------------
-# Data storage
-# -----------------------------
-CSV_FILE = "system_log.csv"
+# ---------------------------------------------------------------------------
+# Streamlit page config
+# ---------------------------------------------------------------------------
+st.set_page_config(
+    page_title=config.app_name,
+    page_icon=None,
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-def log_data(cpu, memory, disk):
-    df = pd.DataFrame([[datetime.now(), cpu, memory, disk]],
-                      columns=["Time", "CPU", "Memory", "Disk"])
-    if os.path.exists(CSV_FILE):
-        df.to_csv(CSV_FILE, mode='a', header=False, index=False)
-    else:
-        df.to_csv(CSV_FILE, index=False)
+# Minimal CSS: tighten default padding and style alert boxes
+st.markdown("""
+<style>
+    .block-container { padding-top: 1.2rem; padding-bottom: 1rem; }
+    .metric-card {
+        background: var(--background-secondary-color, #f7f7f7);
+        border-radius: 10px;
+        padding: 1rem 1.2rem;
+        border: 1px solid rgba(150,150,150,0.15);
+    }
+    .alert-critical {
+        background: rgba(232, 107, 91, 0.12);
+        border-left: 3px solid #E86B5B;
+        border-radius: 0 6px 6px 0;
+        padding: 0.5rem 0.9rem;
+        margin-bottom: 0.4rem;
+        font-size: 0.9rem;
+    }
+    .alert-warning {
+        background: rgba(232, 184, 91, 0.12);
+        border-left: 3px solid #E8B85B;
+        border-radius: 0 6px 6px 0;
+        padding: 0.5rem 0.9rem;
+        margin-bottom: 0.4rem;
+        font-size: 0.9rem;
+    }
+    .rec-high   { border-left: 3px solid #E86B5B; padding: 0.5rem 0.8rem; border-radius: 0 6px 6px 0; margin-bottom: 0.5rem; }
+    .rec-medium { border-left: 3px solid #E8B85B; padding: 0.5rem 0.8rem; border-radius: 0 6px 6px 0; margin-bottom: 0.5rem; }
+    .rec-low    { border-left: 3px solid #5BB88A; padding: 0.5rem 0.8rem; border-radius: 0 6px 6px 0; margin-bottom: 0.5rem; }
+    .verdict-safe       { color: #5BB88A; font-weight: 600; }
+    .verdict-suspicious { color: #E8B85B; font-weight: 600; }
+    .verdict-dangerous  { color: #E86B5B; font-weight: 600; }
+    .verdict-unknown    { color: #888888; font-weight: 600; }
+    h2 { font-size: 1.1rem !important; font-weight: 600; }
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+    .stTabs [data-baseweb="tab"]      { padding: 0.4rem 1rem; font-size: 0.9rem; }
+</style>
+""", unsafe_allow_html=True)
 
-# -----------------------------
-# System stats
-# -----------------------------
-def get_system_stats():
-    cpu = psutil.cpu_percent(interval=1)
-    memory = psutil.virtual_memory().percent
-    disk = psutil.disk_usage('/').percent
-    log_data(cpu, memory, disk)
-    # Notifications
-    if cpu > 85:
-        toaster.show_toast("High CPU Usage", f"CPU at {cpu}%", duration=5)
-    if memory > 85:
-        toaster.show_toast("High Memory Usage", f"Memory at {memory}%", duration=5)
-    if disk > 95:
-        toaster.show_toast("Disk Almost Full", f"Disk at {disk}%", duration=5)
-    return cpu, memory, disk
+# ---------------------------------------------------------------------------
+# DB init (idempotent — safe to call on every run)
+# ---------------------------------------------------------------------------
+initialize_db()
 
-# -----------------------------
-# Idle apps (>7 days)
-# -----------------------------
-def get_idle_apps(days=7):
-    idle_apps = []
-    threshold = datetime.now() - timedelta(days=days)
-    program_dirs = [os.getenv("PROGRAMFILES"), os.getenv("PROGRAMFILES(X86)")]
-    for dir_path in program_dirs:
-        if dir_path and os.path.exists(dir_path):
-            for root, dirs, files in os.walk(dir_path):
-                for file in files:
-                    if file.endswith(".exe"):
-                        try:
-                            full_path = os.path.join(root, file)
-                            last_used = datetime.fromtimestamp(os.path.getatime(full_path))
-                            if last_used < threshold:
-                                idle_apps.append((file, last_used))
-                        except:
-                            continue
-    return idle_apps
 
-# -----------------------------
-# Heavy background apps
-# -----------------------------
-HEAVY_APPS = ["chrome.exe", "code.exe", "msedge.exe", "teams.exe", "skype.exe"]
-def get_heavy_background_apps():
-    running = []
-    for proc in psutil.process_iter(['name', 'cpu_percent']):
-        try:
-            if proc.info['name'] in HEAVY_APPS and proc.info['cpu_percent'] < 1:
-                running.append(proc.info['name'])
-        except:
-            continue
-    return running
+# ---------------------------------------------------------------------------
+# Cached data loaders
+# Use st.cache_data with short TTL so dashboard feels live but not spammy.
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=config.monitor.poll_interval_seconds, show_spinner=False)
+def _cached_snapshot():
+    return collect_snapshot()
 
-# -----------------------------
-# Laptop Health Score
-# -----------------------------
-def calculate_health(cpu, memory, disk, idle_apps, heavy_apps):
-    score = 100
-    # Deduct points
-    score -= max(cpu-50, 0) * 0.5
-    score -= max(memory-50, 0) * 0.5
-    score -= max(disk-70, 0) * 0.3
-    score -= len(idle_apps) * 0.5
-    score -= len(heavy_apps) * 0.5
-    return max(int(score), 0)
 
-# -----------------------------
-# AI Recommendations
-# -----------------------------
-def ask_ai(cpu, memory, disk, idle_apps, heavy_apps):
-    issues = []
-    if cpu>80: issues.append("High CPU")
-    if memory>80: issues.append("High Memory")
-    if disk>90: issues.append("Disk almost full")
-    
-    idle_names = [name for name, _ in idle_apps]
-    prompt=f"""
-    Laptop stats:
-    CPU: {cpu}%
-    Memory: {memory}%
-    Disk: {disk}%
-    Idle apps (>7 days): {idle_names}
-    Background heavy apps: {heavy_apps}
-    Issues detected: {issues}
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_processes():
+    return get_top_processes(10)
 
-    Suggest actionable cleanup steps, apps to uninstall, temp files to delete, and optimizations.
-    """
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role":"user","content":prompt}]
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_heavy():
+    return get_heavy_background_processes()
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_idle_apps():
+    return scan_idle_apps()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_metrics_df():
+    return fetch_metrics()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_anomaly_history():
+    return fetch_recent_anomalies(50)
+
+
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
+col_title, col_version = st.columns([8, 2])
+with col_title:
+    st.markdown(f"### {config.app_name}")
+with col_version:
+    st.caption(f"v{config.version}")
+
+# ---------------------------------------------------------------------------
+# Collect live data
+# ---------------------------------------------------------------------------
+with st.spinner("Collecting system data..."):
+    snapshot = _cached_snapshot()
+    alerts   = evaluate_alerts(snapshot)
+
+# Show active alerts inline below the header
+if alerts:
+    for alert in alerts:
+        cls = "alert-critical" if alert.level == "critical" else "alert-warning"
+        st.markdown(
+            f'<div class="{cls}">{alert.level.upper()}: {alert.message}</div>',
+            unsafe_allow_html=True,
         )
-        return response.choices[0].message.content
-    except Exception as e:
-        return f"AI Recommendations unavailable: {e}"
 
-# -----------------------------
-# Clean temp files
-# -----------------------------
-def clean_temp_files():
-    temp_dir = os.getenv("TEMP")
-    try:
-        shutil.rmtree(temp_dir)
-        return "Temporary files cleaned ✅"
-    except Exception as e:
-        return f"Failed to clean temp files: {e}"
+# ---------------------------------------------------------------------------
+# Tabs
+# ---------------------------------------------------------------------------
+tab_overview, tab_processes, tab_ai, tab_history, tab_url = st.tabs([
+    "Overview", "Processes", "AI Advisor", "History & Forecast", "URL Safety"
+])
 
-# -----------------------------
-# Predictive trends
-# -----------------------------
-def predict_usage(df):
-    df = df.copy()
-    df['TimeInt'] = range(len(df))
-    predictions = {}
-    for metric in ["CPU","Memory","Disk"]:
-        X = df[['TimeInt']]
-        y = df[metric]
-        model = LinearRegression().fit(X,y)
-        future_X = pd.DataFrame({'TimeInt': range(len(df), len(df)+7)})
-        predictions[metric] = model.predict(future_X)
-    return predictions
 
-# -----------------------------
-# Basic URL safety check (fallback)
-# -----------------------------
-def safe_url_check(url):
-    try:
-        result = urlparse(url)
-        if all([result.scheme, result.netloc]):
-            try:
-                r = requests.head(url, timeout=5)
-                if r.status_code >= 400:
-                    return f"⚠️ URL reachable but returned status {r.status_code}"
-                else:
-                    return "✅ URL reachable, seems safe (basic check)"
-            except:
-                return "⚠️ URL could not be reached. Be cautious!"
+# ===========================================================================
+# TAB: Overview
+# ===========================================================================
+with tab_overview:
+    # Metric cards
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("CPU", f"{snapshot.cpu:.1f}%",
+                  delta=None, help="Current CPU utilization across all cores")
+    with col2:
+        st.metric("Memory", f"{snapshot.memory:.1f}%",
+                  delta=f"{snapshot.memory_available_gb} GB free")
+    with col3:
+        st.metric("Disk", f"{snapshot.disk:.1f}%",
+                  delta=f"{snapshot.disk_free_gb} GB free")
+    with col4:
+        idle_apps = _cached_idle_apps()
+        heavy_apps = _cached_heavy()
+        df_hist = _cached_metrics_df()
+        anomalies = detect_anomalies(df_hist) if len(df_hist) >= 30 else []
+        anomaly_count = sum(1 for a in anomalies if a.is_anomaly)
+        health = compute_health_score(snapshot, len(idle_apps), len(heavy_apps), anomaly_count)
+        st.metric("Health Score", f"{health}/100")
+
+    st.divider()
+
+    col_gauge, col_info = st.columns([2, 3])
+    with col_gauge:
+        st.plotly_chart(health_gauge(health), use_container_width=True, config={"displayModeBar": False})
+
+    with col_info:
+        st.markdown("**Anomaly detection**")
+        if not anomalies:
+            st.caption("Not enough data yet. Collecting baseline...")
         else:
-            return "⚠️ Invalid URL format"
-    except:
-        return "⚠️ Error parsing URL. Be cautious!"
+            for a in anomalies:
+                flag = "ANOMALY" if a.is_anomaly else "normal"
+                st.caption(
+                    f"{a.metric.upper()}: {a.current_value:.1f}%  |  "
+                    f"mean {a.mean_value:.1f}%  |  {flag}"
+                )
 
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-st.title("🖥️ AI Laptop Optimizer v5 - Safe URL & AI Fallback")
+        st.markdown("**Cleanup**")
+        if st.button("Clean temporary files", type="secondary"):
+            success, msg = clean_temp_files()
+            if success:
+                st.success(msg)
+            else:
+                st.error(msg)
 
-cpu, memory, disk = get_system_stats()
+    # Quick stats
+    st.divider()
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(f"**Idle apps detected:** {len(idle_apps)}")
+        if idle_apps:
+            with st.expander("Show idle apps"):
+                rows = [{"Name": a.name, "Last used": a.last_accessed.strftime("%Y-%m-%d"), "Size (MB)": a.size_mb}
+                        for a in idle_apps[:30]]
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-# Metrics
-st.subheader("Current Metrics")
-st.metric("CPU Usage", f"{cpu}%")
-st.metric("Memory Usage", f"{memory}%")
-st.metric("Disk Usage", f"{disk}%")
+    with c2:
+        st.markdown(f"**Heavy background processes:** {len(heavy_apps)}")
+        if heavy_apps:
+            with st.expander("Show heavy background apps"):
+                rows = [{"Name": p.name, "Memory (MB)": p.memory_mb, "Status": p.status}
+                        for p in heavy_apps]
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-# Apps
-idle_apps = get_idle_apps()
-heavy_apps = get_heavy_background_apps()
 
-st.subheader("Idle Apps (>7 days)")
-if idle_apps:
-    for name, last_used in idle_apps:
-        st.write(f"{name} - Last Used: {last_used.strftime('%Y-%m-%d')}")
-else:
-    st.write("No apps detected")
+# ===========================================================================
+# TAB: Processes
+# ===========================================================================
+with tab_processes:
+    procs = _cached_processes()
+    if procs:
+        st.plotly_chart(top_processes_bar(procs), use_container_width=True, config={"displayModeBar": False})
+        st.divider()
+        rows = [
+            {
+                "PID": p.pid,
+                "Name": p.name,
+                "CPU %": f"{p.cpu_percent:.1f}",
+                "Memory MB": f"{p.memory_mb:.0f}",
+                "Status": p.status,
+            }
+            for p in procs
+        ]
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No process data available.")
 
-st.subheader("Background Heavy Apps (low CPU)")
-st.write(heavy_apps if heavy_apps else "No heavy idle apps detected")
+    if st.button("Refresh process list"):
+        st.cache_data.clear()
+        st.rerun()
 
-# Health Score
-health = calculate_health(cpu, memory, disk, idle_apps, heavy_apps)
-st.subheader("Laptop Health Score")
-st.progress(health)
-st.write(f"Score: {health}/100")
 
-# AI Recommendations
-st.subheader("AI Recommendations")
-st.write(ask_ai(cpu, memory, disk, idle_apps, heavy_apps))
+# ===========================================================================
+# TAB: AI Advisor
+# ===========================================================================
+with tab_ai:
+    st.markdown("AI-powered optimization recommendations using Claude.")
 
-# Cleanup button
-if st.button("Clean Temporary Files"):
-    st.write(clean_temp_files())
+    idle_names  = [a.name for a in (_cached_idle_apps())]
+    heavy_names = [p.name for p in (_cached_heavy())]
+    anomaly_labels = [f"{a.metric} anomaly" for a in anomalies if a.is_anomaly]
 
-# Historical trends
-if os.path.exists(CSV_FILE):
-    df = pd.read_csv(CSV_FILE)
-    st.subheader("Metrics Over Time")
-    fig = px.line(df, x="Time", y=["CPU","Memory","Disk"],
-                  labels={"value":"Usage (%)","Time":"Time"}, title="System Metrics Over Time")
-    st.plotly_chart(fig, use_container_width=True)
-
-    # Predictive trends
-    st.subheader("Predicted Metrics (Next 7 Intervals)")
-    preds = predict_usage(df)
-    pred_df = pd.DataFrame(preds)
-    pred_df['Time'] = pd.date_range(start=pd.to_datetime(df['Time'].iloc[-1]), periods=8, freq='H')[1:]
-    fig_pred = px.line(pred_df, x="Time", y=["CPU","Memory","Disk"], title="Predicted Metrics")
-    st.plotly_chart(fig_pred, use_container_width=True)
-
-# -----------------------------
-# URL Safety Check
-# -----------------------------
-st.subheader("🔗 URL Safety Checker")
-url_input = st.text_input("Enter URL to check:")
-
-if url_input:
-    try:
-        # Attempt AI check first
-        prompt = f"Check if the URL is safe: {url_input}"
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role":"user","content":prompt}]
+    if not config.ai.anthropic_api_key:
+        st.warning(
+            "ANTHROPIC_API_KEY not set in your .env file. "
+            "Using rule-based recommendations. "
+            "Add your free API key to unlock AI-powered analysis."
         )
-        st.write(response.choices[0].message.content)
-    except:
-        # Fallback if quota exceeded or error
-        st.write(safe_url_check(url_input))
+
+    with st.spinner("Generating recommendations..."):
+        result = get_recommendations(
+            snapshot.cpu, snapshot.memory, snapshot.disk,
+            idle_names, heavy_names, anomaly_labels,
+        )
+
+    if result.error:
+        st.error(result.error)
+    else:
+        if result.used_cache:
+            st.caption("Showing cached recommendations.")
+
+        st.markdown(f"**Summary:** {result.summary}")
+        st.divider()
+
+        priority_order = {"high": 0, "medium": 1, "low": 2}
+        sorted_recs = sorted(result.recommendations, key=lambda r: priority_order.get(r.priority, 9))
+
+        for rec in sorted_recs:
+            cls = f"rec-{rec.priority}"
+            st.markdown(
+                f'<div class="{cls}">'
+                f'<strong>[{rec.priority.upper()}] {rec.title}</strong><br>'
+                f'{rec.action}<br>'
+                f'<small>Expected impact: {rec.estimated_impact}</small>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    if st.button("Refresh recommendations", type="secondary"):
+        st.cache_data.clear()
+        st.rerun()
+
+
+# ===========================================================================
+# TAB: History & Forecast
+# ===========================================================================
+with tab_history:
+    df = _cached_metrics_df()
+
+    if df.empty:
+        st.info("No historical data yet. The dashboard collects a snapshot each time it loads.")
+    else:
+        # Forecast
+        forecasts = forecast_usage(df)
+        trend_df = build_trend_dataframe(df, forecasts)
+
+        st.plotly_chart(
+            metric_timeseries(trend_df),
+            use_container_width=True,
+            config={"displayModeBar": False},
+        )
+
+        if forecasts:
+            st.markdown("**7-interval forecast**")
+            cols = st.columns(3)
+            for i, fc in enumerate(forecasts):
+                with cols[i]:
+                    arrow = "rising" if fc.trend == "rising" else "falling" if fc.trend == "falling" else "stable"
+                    st.metric(
+                        fc.metric.capitalize(),
+                        f"{fc.predicted_values[-1]:.1f}%",
+                        delta=fc.trend,
+                    )
+                    st.caption(f"R2: {fc.confidence_r2:.3f}")
+
+        st.divider()
+        st.plotly_chart(metric_distribution(df), use_container_width=True, config={"displayModeBar": False})
+
+        # Anomaly history
+        df_anomalies = _cached_anomaly_history()
+        fig_anomalies = anomaly_scatter(df_anomalies)
+        if fig_anomalies:
+            st.divider()
+            st.plotly_chart(fig_anomalies, use_container_width=True, config={"displayModeBar": False})
+
+        # Raw data export
+        with st.expander("Export raw data"):
+            st.dataframe(df.tail(200), use_container_width=True)
+            csv = df.to_csv(index=False)
+            st.download_button("Download CSV", data=csv, file_name="system_metrics.csv", mime="text/csv")
+
+
+# ===========================================================================
+# TAB: URL Safety
+# ===========================================================================
+with tab_url:
+    st.markdown("Enter a URL to evaluate before visiting it.")
+
+    url_input = st.text_input("URL", placeholder="https://example.com")
+
+    if url_input:
+        with st.spinner("Analyzing URL..."):
+            result = check_url_safety(url_input)
+
+        verdict_class = f"verdict-{result.verdict}"
+        st.markdown(
+            f'Verdict: <span class="{verdict_class}">{result.verdict.upper()}</span> '
+            f'(confidence: {result.confidence})',
+            unsafe_allow_html=True,
+        )
+        st.markdown(f"**Recommendation:** {result.recommendation}")
+        if result.reasons:
+            st.markdown("**Reasons:**")
+            for r in result.reasons:
+                st.markdown(f"- {r}")
+
+    st.divider()
+    st.caption(
+        "Note: AI URL analysis provides an opinion based on patterns, not a definitive security scan. "
+        "For production use, integrate a dedicated threat intelligence API such as VirusTotal."
+    )
+
+# ---------------------------------------------------------------------------
+# Auto-refresh every N seconds
+# ---------------------------------------------------------------------------
+refresh = st.sidebar.slider("Auto-refresh (seconds)", 5, 60, 10)
+st.sidebar.caption(f"Last snapshot: {snapshot.timestamp.strftime('%H:%M:%S')}")
+time.sleep(0)  # yield to allow Streamlit to render
+st.sidebar.button("Refresh now", on_click=st.cache_data.clear)
